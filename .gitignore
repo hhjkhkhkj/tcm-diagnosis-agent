@@ -1,0 +1,38 @@
+# ===== 数据一律不进仓库 =====
+# 数据源是正式出版的在售书籍，扫描件 / OCR 文本 / 抽出的映射表都不公开分发。
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+_*.json
+_*.jsonl
+_*.txt
+*_raw.txt
+*.csv
+书/
+图片转pdf_*/
+_临时脚本/
+_质检/
+_样本/
+
+# ===== 密钥 =====
+config.py
+config.local.py
+key.txt
+*.key
+.env
+
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store

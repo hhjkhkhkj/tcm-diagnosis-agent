@@ -1,0 +1,8 @@
+requests
+fastapi
+uvicorn[standard]
+pydantic
+pymupdf
+Pillow
+numpy
+rapidocr-onnxruntime
