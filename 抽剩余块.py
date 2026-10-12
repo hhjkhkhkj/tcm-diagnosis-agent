@@ -45,7 +45,7 @@ for line in open(os.path.join(SRC, "_方名表.txt"), encoding="utf-8"):
 import sys
 
 sys.path.insert(0, SRC)
-import 建库                                  # 复用 FIX_YAO
+import _建库                                  # 复用 FIX_YAO
 FIX_YAO = dict(_建库.FIX_YAO)
 FIX_YAO.update({"千姜": "干姜", "于姜": "干姜", "白": "白芍", "积实": "枳实",
                 "秦芃": "秦艽", "猪苓": "猪苓", "炮附子": "炮附子"})

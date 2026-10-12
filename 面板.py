@@ -20,7 +20,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from 检索 import 中医库, 展开, DB          # noqa: E402
+from 中医检索 import 中医库, 展开, DB          # noqa: E402
 from 模型判断 import 全判, DS_KEY, DS_URL, DS_MODEL   # noqa: E402
 from 问诊框架 import 框架, 造用户消息             # noqa: E402
 
@@ -40,6 +40,7 @@ class 请求(BaseModel):
 class 判断请求(BaseModel):
     标签: list[str]
     候选: list[str]
+    原文: str = ""
 
 
 class 问诊请求(BaseModel):
@@ -271,7 +272,7 @@ def 判断接口(请求数据: 判断请求):
         t = sorted(set(t))
         症状 = [x for x in t if not any(k in x for k in "舌脉苔")]
         舌脉 = [x for x in t if any(k in x for k in "舌脉苔")]
-        return 全判(请求数据.候选, 症状, 舌脉)
+        return 全判(请求数据.候选, 症状, 舌脉, 请求数据.原文)
     except Exception:
         import traceback
         return {"错误": traceback.format_exc()}
@@ -317,6 +318,21 @@ def 问诊接口(请求数据: 问诊请求):
             yield "\n\n[出错] " + str(e)[:300]
 
     return StreamingResponse(生成(), media_type="text/plain; charset=utf-8")
+
+
+class 抽标签请求(BaseModel):
+    输入: str
+
+
+@app.post("/抽标签")
+def 抽标签接口(请求数据: 抽标签请求):
+    """自由文本 → 受控标签。给前端拿去预填表单，让人核对。"""
+    try:
+        t = 抽标签(请求数据.输入, [])
+        return {"标签": t, "全部": 词表}
+    except Exception:
+        import traceback
+        return {"错误": traceback.format_exc()}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -395,12 +411,15 @@ mark{background:var(--hi);color:var(--ink);border-radius:3px;padding:0 2px}
       <input id="搜索" placeholder="筛标签…（如 苔 / 便 / 脉）">
       <div class="grp" id="g舌脉"><b>舌象 / 脉象</b><div class="tags"></div></div>
       <div class="grp" id="g症状"><b>症状</b><div class="tags"></div></div>
-      <button id="跑">查</button>
+      <button id="跑">查（快 · 纯检索）</button>
+      <button id="跑问" class="mini" style="width:100%;padding:12px;margin-top:8px">带这些标签问 AI（慢 · 30~60 秒）</button>
+      <div class="v" style="margin-top:6px;font-size:11.5px">上面是毫秒级的代码检索；下面的走完整推演，出会诊意见。</div>
     </div>
 
     <div id="区问诊" hidden>
       <textarea id="四诊" placeholder="把四诊写在这里，自由文字就行。例：&#10;&#10;男，42岁。怕冷，手脚冰凉，腹部怕凉，遇冷即腹泻，泻后舒服。大便一天2-3次偏溏。夜尿2-3次。腰膝酸冷。&#10;&#10;舌：舌体胖大、边有齿痕，舌质淡，舌苔白滑，中根部略厚&#10;脉：右寸关沉细弱，尺部尤弱；左关略弦"></textarea>
       <div class="v" style="margin:10px 0 12px;font-size:12px">不用勾标签——系统会自己从受控词表里抽。缺什么它会指出来。</div>
+      <button id="抽" class="mini" style="width:100%;padding:12px">抽取标签 → 我来核对</button>
       <button id="问">问 诊</button>
     </div>
   </div>
@@ -442,11 +461,40 @@ document.querySelectorAll(".tab").forEach(b=>{
   };
 });
 
-// 问诊（流式）
-$("#问").onclick=async()=>{
+// 抽取标签 -> 切到快查、预勾选、让人核对
+$("#抽").onclick=async()=>{
   const t=$("#四诊").value.trim();
   if(!t){$("#结果").innerHTML='<div class="card"><span class="empty">先写点四诊。</span></div>';return;}
-  const b=$("#问"); b.disabled=true; b.textContent="推演中…";
+  const b=$("#抽"); b.disabled=true; b.textContent="抽取中…";
+  try{
+    const r=await fetch("/抽标签",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({输入:t})});
+    const d=await r.json();
+    if(d.错误){
+      $("#结果").innerHTML='<div class="card"><span class="empty">出错：'+esc(String(d.错误).slice(0,300))+'</span></div>';
+    }else{
+      // 切到「快查」，清掉搜索过滤，重渲染全部标签
+      document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("on",x.dataset.m==="查"));
+      $("#区查").hidden=false; $("#区问诊").hidden=true;
+      $("#搜索").value="";
+      渲染(词表.舌脉,$("#g舌脉 .tags"));渲染(词表.症状,$("#g症状 .tags"));
+      const 集=new Set(d.标签||[]);
+      document.querySelectorAll('#区查 input[type=checkbox]').forEach(x=>{x.checked=集.has(x.value);});
+      $("#结果").innerHTML='<div class="card"><h2>抽取结果 —— 请核对</h2>'+
+        '<div class="note">抽出 <b>'+(d.标签||[]).length+'</b> 个标签，已在左边勾好。<br>'+
+        '<b>对的不用动、多的取消、少的补勾</b>，然后按「查」。<br>'+
+        '⚠️ 抽漏是常事（例："大便偏溏"这种换了个说法的可能认不出）—— <b>缺哪个自己补上</b>。</div>'+
+        '<div>'+((d.标签||[]).map(x=>'<span class="hit">'+esc(x)+'</span>').join("")||'<span class="empty">一个都没抽到</span>')+'</div></div>';
+    }
+  }catch(e){$("#结果").innerHTML='<div class="card"><span class="empty">连不上：'+esc(e)+'</span></div>';}
+  b.disabled=false; b.textContent="抽取标签 → 我来核对";
+};
+
+// 问诊（流式）—— 两个入口共用：
+//   ① 问诊页签直接问（标签传空，后端自己抽）
+//   ② 快查页签核对完标签后带着问（标签由人确定，后端不再抽）
+async function 流式问诊(标签, 原文本, b, 原名){
+  b.disabled=true; b.textContent="推演中…";
   $("#结果").innerHTML=
     '<div class="card"><div id="think" class="note" style="margin-bottom:14px">'+
     '正在推演…　<b>首次出字要等 20~40 秒</b>（模型先在内部思考，这段时间它不会输出任何字，不是卡住）。</div>'+
@@ -462,7 +510,7 @@ $("#问").onclick=async()=>{
   },1000);
   try{
     const r=await fetch("/问诊",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({输入:t,标签:[]})});
+      body:JSON.stringify({输入:原文本,标签:标签})});
     if(!r.ok){pre.textContent="服务返回 HTTP "+r.status+"\n"+(await r.text()).slice(0,500);}
     else{
       const rd=r.body.getReader(), dec=new TextDecoder("utf-8");
@@ -477,7 +525,22 @@ $("#问").onclick=async()=>{
   }catch(e){pre.textContent+="\n\n[出错] "+e;}
   clearInterval(timer);
   think.innerHTML='完成，用时 '+Math.round((Date.now()-t0)/1000)+' 秒';
-  b.disabled=false; b.textContent="问 诊";
+  b.disabled=false; b.textContent=原名;
+}
+
+// 入口①：问诊页签直接问
+$("#问").onclick=()=>{
+  const t=$("#四诊").value.trim();
+  if(!t){$("#结果").innerHTML='<div class="card"><span class="empty">先写点四诊。</span></div>';return;}
+  流式问诊([], t, $("#问"), "问 诊");
+};
+
+// 入口②：快查页签核对完标签，带着这些标签问（标签是人工确认过的，后端不再抽）
+$("#跑问").onclick=()=>{
+  const 标签=[...document.querySelectorAll('#区查 input:checked')].map(x=>x.value);
+  if(!标签.length){$("#结果").innerHTML='<div class="card"><span class="empty">先在左边勾几个标签。</span></div>';return;}
+  const t=$("#四诊").value.trim();
+  流式问诊(标签, t || ("（由勾选的标签提交）"), $("#跑问"), "带这些标签问 AI（慢 · 30~60 秒）");
 };
 
 $("#跑").onclick=async()=>{
@@ -557,7 +620,8 @@ function 画(d){
     $("#pout").innerHTML='<span class="v">等两个模型回话…</span>';
     try{
       const r=await fetch("/判断",{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({标签:d.标签, 候选:d.候选方.map(c=>c.方名)})});
+        body:JSON.stringify({标签:d.标签, 候选:d.候选方.map(c=>c.方名),
+                              原文:$("#四诊").value.trim()})});
       const j=await r.json();
       if(j.错误){
         $("#pout").innerHTML='<span class="v">出错：'+esc(String(j.错误).slice(0,400))+'</span>';
@@ -567,6 +631,8 @@ function 画(d){
             .map(([k,v])=>esc(k)+" "+f(v)).join("　");
         s+='<div class="row"><b>Jev</b><div class="v">'+列(j.jev,v=>(v*100).toFixed(0)+"%")+'</div></div>';
         s+='<div class="row"><b>DeepSeek</b><div class="v">'+列(j.ds,v=>v)+'</div></div>';
+        if(j.整理后陈述) s+='<div class="note" style="margin:8px 0"><b>整理层输出 —— Jev 实际读到的就是这段</b>'+
+            '<div style="margin-top:6px;color:var(--ink)">'+esc(j.整理后陈述)+'</div></div>';
         if(j.结论) s+='<div class="row '+(j.一致?"一致":"分歧")+'">'+esc(j.结论)+'</div>';
         if(j.jev错) s+='<div class="v">Jev 出错：'+esc(String(j.jev错).slice(0,200))+'</div>';
         if(j.ds错)  s+='<div class="v">DeepSeek 出错：'+esc(String(j.ds错).slice(0,200))+'</div>';

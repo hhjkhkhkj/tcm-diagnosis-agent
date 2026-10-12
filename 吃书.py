@@ -175,7 +175,7 @@ def 抽表格(ocr目录, pdfs, 出json):
     """复用 _表格重建.py 的算法；页码用全局编号，靠 页码映射.json 找回原 PDF"""
     import pymupdf
     from rapidocr_onnxruntime import RapidOCR
-    import 表格重建 as T
+    import _表格重建 as T
 
     映射 = json.load(open(os.path.join(ocr目录, "_页码映射.json"), encoding="utf-8"))
     页 = []

@@ -24,8 +24,7 @@ import requests
 SRC = r"D:\Download\医案集_OCR"
 DB = os.path.join(SRC, "中医大脑医案库.db")
 
-# 密钥与模型调用统一从 模型判断.py 拿
-# （密钥读的是 config.py，那个文件不进仓库）
+# 密钥与模型调用统一从 模型判断.py 拿（密钥在 config.py 里，那个文件不进仓库）
 from 模型判断 import (JEV_KEY, JEV_URL, JEV_MODEL,      # noqa: F401
                       DS_KEY, DS_URL, DS_MODEL, canon)  # noqa: F401
 
