@@ -10,8 +10,8 @@
       -> 输出结构化 JSON + 人看的 markdown
 
 用法：
-    py _表格重建.py test     只跑 1 页，打印过程（先验证再用）
-    py _表格重建.py          跑全部
+    py 表格重建.py test     只跑 1 页，打印过程（先验证再用）
+    py 表格重建.py          跑全部
 """
 import glob
 import io
@@ -186,7 +186,7 @@ def main():
     pages = find_pages("药对分析") + find_pages("单味药分析")
     pages = sorted(set(pages))
     if only_one:
-        # 允许 py _表格重建.py test <目录号> <页号>
+        # 允许 py 表格重建.py test <目录号> <页号>
         if len(sys.argv) >= 4:
             d = [k for k in PDF_OF if sys.argv[2] in k][0]
             pages = [(d, int(sys.argv[3]))]

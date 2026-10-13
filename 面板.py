@@ -12,7 +12,7 @@ import re
 import sqlite3
 import sys
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 from fastapi import FastAPI
@@ -20,8 +20,9 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from 中医检索 import 中医库, 展开, DB          # noqa: E402
-from 模型判断 import 全判, DS_KEY, DS_URL, DS_MODEL   # noqa: E402
+from 检索 import 中医库, 展开, DB          # noqa: E402
+from 模型判断 import (全判, 抽取_KEY, 抽取_URL, 抽取_MODEL,
+                     推演_KEY, 推演_URL, 推演_MODEL, 推演_TEMP)   # noqa: E402
 from 问诊框架 import 框架, 造用户消息             # noqa: E402
 
 端口 = 8020
@@ -56,6 +57,13 @@ class 录入请求(BaseModel):
     处方: str = ""
     效果: str = ""
     备注: str = ""
+    随访天数: int = 14
+
+
+class 随访请求(BaseModel):
+    id: int
+    效果: str = ""
+    随访日期: str = ""
 
 
 RE_YAO_TXT = re.compile(r"([一-鿿]{2,6})\s*([\d.]+)\s*[gG]")
@@ -64,6 +72,12 @@ RE_YAO_TXT = re.compile(r"([一-鿿]{2,6})\s*([\d.]+)\s*[gG]")
 def 连库():
     c = sqlite3.connect(DB, check_same_thread=False)
     c.row_factory = sqlite3.Row
+    # 旧库可能没有这两列，只加不删
+    for col, typ in [("随访日期", "TEXT"), ("随访完成", "INTEGER")]:
+        try:
+            c.execute("ALTER TABLE 我的病案 ADD COLUMN %s %s" % (col, typ))
+        except Exception:
+            pass
     return c
 
 
@@ -76,16 +90,18 @@ def 录入接口(请求数据: 录入请求):
         舌脉 = [t for t in 标签 if any(k in t for k in "舌脉苔")]
         药 = [{"药": m.group(1), "量": float(m.group(2))} for m in RE_YAO_TXT.finditer(请求数据.处方)]
         c = 连库()
+        随访 = (datetime.now() + timedelta(days=请求数据.随访天数)).strftime("%Y-%m-%d") if 请求数据.随访天数 else None
         c.execute("""INSERT INTO 我的病案
-            (日期,患者,四诊原文,症状,舌脉,证型,方名,处方,效果,备注)
-            VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (日期,患者,四诊原文,症状,舌脉,证型,方名,处方,效果,备注,随访日期,随访完成)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,0)""",
                   (datetime.now().strftime("%Y-%m-%d"), 请求数据.患者, 请求数据.四诊原文,
                    json.dumps(症状, ensure_ascii=False), json.dumps(舌脉, ensure_ascii=False),
                    请求数据.证型, 请求数据.方名,
-                   json.dumps(药, ensure_ascii=False), 请求数据.效果, 请求数据.备注))
+                   json.dumps(药, ensure_ascii=False), 请求数据.效果, 请求数据.备注, 随访))
         c.commit()
         c.close()
-        return {"ok": True, "抽到标签": 标签, "抽到药": ["%s%gg" % (x["药"], x["量"]) for x in 药]}
+        return {"ok": True, "抽到标签": 标签, "抽到药": ["%s%gg" % (x["药"], x["量"]) for x in 药],
+                "随访日期": 随访}
     except Exception:
         import traceback
         return {"错误": traceback.format_exc()}
@@ -98,6 +114,29 @@ def 列我的病案():
     n = c.execute("SELECT COUNT(*) FROM 我的病案").fetchone()[0]
     c.close()
     return {"共": n, "列表": rows}
+
+
+@app.get("/待回访")
+def 待回访():
+    """到期 / 过期还没填效果的病案 —— 这是 Y 的来源，攒数据的那个入口"""
+    c = 连库()
+    rows = [dict(r) for r in c.execute("""
+        SELECT id,日期,患者,证型,方名,处方,随访日期 FROM 我的病案
+        WHERE (随访完成 IS NULL OR 随访完成=0) AND 随访日期 IS NOT NULL AND 随访日期<='今'
+        ORDER BY 随访日期""".replace("'今'", "date('now')"))]
+    c.close()
+    return {"待回访": rows}
+
+
+@app.post("/随访")
+def 随访接口(请求数据: 随访请求):
+    """回访到了就填效果 —— 这一步填下去，「这个方对不对」才从猜变成有数"""
+    c = 连库()
+    c.execute("UPDATE 我的病案 SET 效果=?, 随访日期=?, 随访完成=1 WHERE id=?",
+              (请求数据.效果, 请求数据.随访日期 or datetime.now().strftime("%Y-%m-%d"), 请求数据.id))
+    c.commit()
+    c.close()
+    return {"ok": True}
 
 
 @app.post("/评测")
@@ -123,9 +162,9 @@ def 模型抽标签(文本):
          "【四诊描述】\n" + 文本)
     try:
         r = requests.post(
-            DS_URL,
-            headers={"Authorization": "Bearer " + DS_KEY, "Content-Type": "application/json"},
-            json={"model": DS_MODEL, "messages": [{"role": "user", "content": p}],
+            抽取_URL,
+            headers={"Authorization": "Bearer " + 抽取_KEY, "Content-Type": "application/json"},
+            json={"model": 抽取_MODEL, "messages": [{"role": "user", "content": p}],
                   "temperature": 0, "response_format": {"type": "json_object"}},
             timeout=90)
         r.raise_for_status()
@@ -156,7 +195,7 @@ def 造材料(标签):
     舌脉 = [t for t in 标签 if any(k in t for k in "舌脉苔")]
     命中 = 库.匹配药对(标签, topn=12)
     候选 = 库.候选方(命中)[:5]
-    相似 = 库.相似病案(症状, 舌脉, topn=4)
+    相似 = 库.相似病案(症状, 舌脉, topn=8)
     if not 标签:
         return "（本次未能在库中匹配到标签，请仅依据医师输入推演，并说明信息不足）"
 
@@ -235,7 +274,7 @@ def 查(请求数据: 请求):
 
     命中 = 库.匹配药对(标签, topn=10)
     候选 = 库.候选方(命中)[:5]
-    相似 = 库.相似病案(症状, 舌脉, topn=4)
+    相似 = 库.相似病案(症状, 舌脉, topn=8)
 
     # 候选方涉及的药 + 剂量
     剂量 = []
@@ -290,12 +329,12 @@ def 问诊接口(请求数据: 问诊请求):
         yield "─" * 30 + "\n\n"
         try:
             r = requests.post(
-                DS_URL,
-                headers={"Authorization": "Bearer " + DS_KEY, "Content-Type": "application/json"},
-                json={"model": DS_MODEL,
+                推演_URL,
+                headers={"Authorization": "Bearer " + 推演_KEY, "Content-Type": "application/json"},
+                json={"model": 推演_MODEL,
                       "messages": [{"role": "system", "content": 框架},
                                    {"role": "user", "content": 消息}],
-                      "temperature": 0.3, "stream": True},
+                      "temperature": 推演_TEMP, "stream": True},
                 stream=True, timeout=300)
             r.raise_for_status()
             for line in r.iter_lines():
@@ -405,6 +444,7 @@ mark{background:var(--hi);color:var(--ink);border-radius:3px;padding:0 2px}
     <div class="tabs">
       <button class="tab on" data-m="查">快查</button>
       <button class="tab" data-m="问诊">问诊（AI）</button>
+      <button class="tab" data-m="病案">我的病案</button>
     </div>
 
     <div id="区查">
@@ -421,6 +461,28 @@ mark{background:var(--hi);color:var(--ink);border-radius:3px;padding:0 2px}
       <div class="v" style="margin:10px 0 12px;font-size:12px">不用勾标签——系统会自己从受控词表里抽。缺什么它会指出来。</div>
       <button id="抽" class="mini" style="width:100%;padding:12px">抽取标签 → 我来核对</button>
       <button id="问">问 诊</button>
+    </div>
+
+    <div id="区病案" hidden>
+      <div class="v" style="font-size:12px;margin-bottom:8px">
+        这一页是你的病案库 —— 书里全是成功案例，<b>「这个方到底对不对」只有你能答</b>。
+        接诊存一条，<b>默认 14 天后回访</b>，到期这页会标出来。
+      </div>
+      <div class="v" style="font-size:12px;margin-bottom:4px">录入一条接诊</div>
+      <input id="患者" placeholder="患者（不写也行）" style="margin-bottom:6px">
+      <textarea id="病案四诊" placeholder="四诊原文（自由写）" style="height:80px"></textarea>
+      <div style="display:flex;gap:6px;margin:6px 0">
+        <input id="证型" placeholder="证型" style="flex:1">
+        <input id="方名" placeholder="方名" style="flex:1">
+      </div>
+      <input id="处方" placeholder="处方，例：桂枝15g 白芍15g 炙甘草10g" style="margin-bottom:6px">
+      <div style="display:flex;gap:6px;margin-bottom:8px">
+        <input id="随访天数" type="number" value="14" style="width:80px">
+        <span class="v" style="font-size:11px;margin-top:10px">天后回访</span>
+        <button id="录病案" style="flex:1;margin:0">存入病案</button>
+      </div>
+      <div class="v" style="font-size:12px;margin:14px 0 4px">已存的病案（点「填回访」补效果）</div>
+      <div id="病案列表"></div>
     </div>
   </div>
   <div id="结果"></div>
@@ -449,17 +511,74 @@ $("#搜索").oninput=e=>{
   渲染(f(词表.舌脉),$("#g舌脉 .tags"));渲染(f(词表.症状),$("#g症状 .tags"));
 };
 
-// 切换：快查 / 问诊
+// 切换：快查 / 问诊 / 病案
 document.querySelectorAll(".tab").forEach(b=>{
   b.onclick=()=>{
     document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("on",x===b));
     const m=b.dataset.m;
     $("#区查").hidden = (m!=="查");
     $("#区问诊").hidden = (m!=="问诊");
+    $("#区病案").hidden = (m!=="病案");
+    if(m==="病案") 载病案();
     $("#结果").innerHTML = (m==="问诊")
       ? '<div class="card"><span class="empty">左边写好四诊，再按下面的「问 诊」。</span></div>' : "";
   };
 });
+
+// 我的病案 —— 列表 + 回访
+async function 载病案(){
+  const r=await fetch("/我的病案");
+  const d=await r.json();
+  const rows=d.列表||[];
+  let h="";
+  if(!rows.length){h='<div class="empty" style="padding:12px 0">还没有病案。存第一条。</div>';}
+  rows.forEach(v=>{
+    const 回访到期 = v.随访日期 && !v.随访完成 && v.随访日期 <= new Date().toISOString().slice(0,10);
+    const 效果=v.效果||"";
+    h+=`<div class="card" style="margin-bottom:10px;padding:12px 14px">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+        <div><b>${esc(v.患者||"—")}</b> <span class="v">${esc(v.日期||"")}</span></div>
+        <div class="v" style="font-size:11.5px">${esc(v.证型||"")}${v.方名?" · "+esc(v.方名):""}</div>
+      </div>
+      ${v.处方?`<div class="v" style="font-size:11.5px;margin-top:6px">${esc(v.处方)}</div>`:""}
+      ${效果?`<div style="margin-top:8px;padding:8px 10px;background:#f6f3ee;border-radius:6px;font-size:12.5px"><b>效果：</b>${esc(效果)}</div>`
+        : (回访到期
+          ? `<div style="margin-top:8px;padding:8px 10px;background:#fdf3f0;border:1px solid #e0b4ad;border-radius:6px">
+              <b style="color:#8c2f21">到回访时间了</b>（${esc(v.随访日期)}）
+              <div style="display:flex;gap:6px;margin-top:8px">
+                <input id="效${v.id}" placeholder="效果怎么样（好点/没变化/更差）" style="flex:1">
+                <button class="mini" onclick="填回访(${v.id})" style="padding:6px 14px">填回访</button>
+              </div></div>`
+          : `<div class="v" style="margin-top:6px;font-size:11.5px">回访 ${esc(v.随访日期||"未定")}${v.随访完成?"（已填）":""}</div>`)}
+    </div>`;
+  });
+  $("#病案列表").innerHTML=h;
+}
+window.填回访=async(id)=>{
+  const v=$("#效"+id).value.trim();
+  if(!v){alert("写点效果再存");return;}
+  await fetch("/随访",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({id:id,效果:v})});
+  载病案();
+};
+
+// 录入一条病案
+$("#录病案").onclick=async()=>{
+  const d={患者:$("#患者").value.trim(), 四诊原文:$("#病案四诊").value.trim(),
+    证型:$("#证型").value.trim(), 方名:$("#方名").value.trim(), 处方:$("#处方").value.trim(),
+    随访天数:parseInt($("#随访天数").value)||0};
+  const r=await fetch("/录入",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(d)});
+  const j=await r.json();
+  if(j.ok){
+    $("#病案列表").insertAdjacentHTML("afterbegin",
+      '<div class="card" style="margin-bottom:10px;padding:10px 12px;border-left:3px solid #8c2f21;font-size:12.5px">'+
+      '已存。'+esc(j.抽到药.join("、")||"未抽到药")+'；回访 '+esc(j.随访日期||"未定")+'</div>');
+    ["患者","病案四诊","证型","方名","处方"].forEach(id=>$("#"+id).value="");
+    载病案();
+  }else{
+    alert("存失败了："+String(j.错误||"").slice(0,200));
+  }
+};
 
 // 抽取标签 -> 切到快查、预勾选、让人核对
 $("#抽").onclick=async()=>{

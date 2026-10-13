@@ -33,12 +33,32 @@ JEV_KEY = _取("JEV_KEY")
 JEV_URL = "https://openrouter.ai/api/alpha/decisions"
 JEV_MODEL = "~typesafe/jev-latest"
 
+# ── 判断层：Jev + DeepSeek 双判。**这三个别动** ──
+# 「一致 88% / 分歧 45%」那套校准数字就是这一对在 27 条上测出来的，
+# 换掉任何一个，那两个数字就作废。
 DS_KEY = _取("DS_KEY")
 DS_URL = "https://api.deepseek.com/v1/chat/completions"
 DS_MODEL = "deepseek-flash"
 
 # 整理层用更强的模型：它要吃「医师的原话」，比改写标签难
 DS_MODEL_整理 = "deepseek-v4-pro"
+
+# ── 推演层：面板「问诊」用的模型 —— **跟判断层拆开的一条独立线** ──
+# 2026-10-13 踩过：原来 DS_MODEL 被这两条线共用，想只换「问诊」结果两边一起变了。
+# 不填 = 回退成判断层那个（DeepSeek）。换法见 config.py。
+推演_KEY = _取("推演_KEY") or DS_KEY
+推演_URL = _取("推演_URL") or DS_URL
+推演_MODEL = _取("推演_MODEL") or DS_MODEL
+
+# 采样温度。统一取 0：kimi-k3 只认 0（给 0.3 直接 400），DeepSeek 两者都认。
+推演_TEMP = float(_取("LLM_TEMP") or 0)
+
+# ── 抽取层：「从原文里挑出确实提到的那几条」——第三条独立线 ──
+# 跟判断层的区别：判断层要「选哪个方」（要推理力），抽取层要「原文里有没有」（照抄）。
+# 实测同样的病例，K3 在 reasoning_effort=low 下输出 201 tok，DeepSeek 要 3250 tok。
+抽取_KEY = _取("抽取_KEY") or DS_KEY
+抽取_URL = _取("抽取_URL") or DS_URL
+抽取_MODEL = _取("抽取_MODEL") or DS_MODEL
 
 
 def canon(name):
@@ -100,9 +120,26 @@ def 整理成陈述(症状, 舌脉, 原文="", timeout=150):
         return ""
 
 
+def _安全底线():
+    """T6 硬性安全规则，**无条件注入**两个模型的输入（计划第 ⑧ 条）。
+
+    与候选方的定位相反：候选方是「可能对」，安全规则是「绝不能错」，
+    所以它不进打分、不参与比较，只作为前提摆在那里。
+    读不到就返回空串——不能因为库缺表就把整个会诊打断。
+    """
+    try:
+        from 检索 import 安全规则文本
+        return 安全规则文本()
+    except Exception:
+        return ""
+
+
 def 问jev(候选, 症状, 舌脉, timeout=90, 整理好的=""):
     """传入 整理好的 就用它当 state；否则回退成标签堆"""
     state = ("患者四诊信息：\n" + 整理好的) if 整理好的 else 造state(症状, 舌脉)
+    底 = _安全底线()
+    if 底:
+        state = 底 + "\n\n" + state
     qs = {}
     for i, o in enumerate(候选):
         qs["o%d" % i] = {
@@ -124,10 +161,15 @@ def 问ds(候选, 症状, 舌脉, timeout=120):
     p = ("你是中医经方专家。根据四诊信息，给每个候选方打 0~100 的匹配分。\n"
          "只输出 JSON：{\"方名\": 分数}，不要任何别的字。\n\n"
          + 造state(症状, 舌脉) + "\n\n候选方：\n" + "\n".join("- " + o for o in 候选))
+    消息 = []
+    底 = _安全底线()
+    if 底:
+        消息.append({"role": "system", "content": 底})
+    消息.append({"role": "user", "content": p})
     r = requests.post(
         DS_URL,
         headers={"Authorization": "Bearer " + DS_KEY, "Content-Type": "application/json"},
-        json={"model": DS_MODEL, "messages": [{"role": "user", "content": p}],
+        json={"model": DS_MODEL, "messages": 消息,
               "temperature": 0, "response_format": {"type": "json_object"}},
         timeout=timeout)
     r.raise_for_status()
