@@ -139,6 +139,17 @@ class 中医库:
         except Exception:
             规范 = {}
 
+        # 六经：抽出来的那批（带来源）。**原文的才是医案自己说的，推断的要标出来** ——
+        # 两者混着展示会让人以为「这案判的就是少阴」，其实可能只是模型猜的。
+        六经 = {}
+        try:
+            for r in self.con.execute(
+                    "SELECT 医案id,因子,来源 FROM 医案因子 WHERE 维度='六经'"):
+                六经.setdefault(r["医案id"], []).append((r["因子"], r["来源"]))
+        except Exception:
+            六经 = {}
+        self.经表 = 六经
+
         # 能参与检索的病案 = 有标签的那些。
         # ⚠️ 这里**不能**再按「方名非空」过滤 —— 倪案 951 例的方名本来就是空的，
         #    一过滤就全被挡掉（2026-10-13 实测：可检索病案只剩 50 例，全是问止，
@@ -164,6 +175,17 @@ class 中医库:
             self.安全规则 = [dict(r) for r in self.con.execute("SELECT * FROM 安全规则")]
         except Exception:
             self.安全规则 = []
+
+    def 经标注(self, 案id):
+        """这条病案当时判的六经 —— **原文的明写、推断的加 (推)**
+
+        分开标是因为两者分量差得远：原文的是医案自己说的，
+        推断的是模型根据症状猜的 —— 混着展示会让人以为「这案判的就是少阴」。
+        """
+        出 = []
+        for 值, 源 in self.经表.get(案id, []):
+            出.append(值 if 源 == "原文" else 值 + "(推)")
+        return 出
 
     # ---------- ① 药对匹配 ----------
     def _载别名(self):
@@ -355,6 +377,7 @@ class 中医库:
                         "pdf": 源, "page": 页,
                         "加权": round(加权, 1), "共有": sorted(交集),
                         "相似度": round(len(交集) / len(我 | his), 3),
+                        "六经": self.经标注(m["id"]),
                         "附属": self.附属(m.get("pdf"), m.get("页"))})
         out.sort(key=lambda x: -x["加权"])
 

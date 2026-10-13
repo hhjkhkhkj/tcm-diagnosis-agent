@@ -39,6 +39,7 @@ DB = os.path.join(HERE, "中医大脑医案库.db")
 sys.path.insert(0, HERE)
 
 from 检索 import SYN   # noqa: E402
+import 因子分析 as A        # noqa: E402  （只用它的数据指纹）
 
 
 def 展开(标签):
@@ -124,6 +125,7 @@ def main():
     p = os.path.join(HERE, "_判据验证.md")
     with open(p, "w", encoding="utf-8") as w:
         w.write("# 六经判据验证（拿 951 案去量书里写好的 7 条判据）\n\n")
+        w.write(A.指纹行())
         w.write("只跟 `依据=原文` 的六经比（%d 案）——模型推断的那批是循环论证，不能当 Y。\n\n"
                 % len(案经))
         w.write("| id | 类型 | 症状组 | 判定 | 命中案 | 有原文标注 | 判对 | 命中率 | 漏检案 | 漏检率 |\n")

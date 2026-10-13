@@ -85,11 +85,32 @@ def 载方剂(con):
 
 # ---------- 病案侧 ----------
 
-def 载病案(con, 只要源=None):
-    """有标签、且有真实处方的医案"""
-    sql = ("""SELECT m.id,m.篇,m.source,m.症状,m.舌脉 FROM 医案 m
-              WHERE m.症状 IS NOT NULL AND m.症状 NOT IN ('','[]')
-                AND EXISTS(SELECT 1 FROM 处方 c WHERE c.医案id=m.id)""")
+def 标签来源名():
+    """这一跑用的是哪套标签 —— 落库的「名称」带上它，两次跑才分得开"""
+    return "原始标签" if os.environ.get("EVAL_RAW_TAGS", "") else "归一标签"
+
+
+def 载病案(con, 只要源=None, 用归一=None):
+    """有标签、且有真实处方的医案
+
+    用归一：标签从哪来 ——
+        True  = `医案因子`（**归一后**的规范因子，检索现在也用这个）
+        False = `医案.症状/舌脉`（原始列，带 OCR 变体）
+        不传  = 看环境变量 `EVAL_RAW_TAGS`；设了就退回原始列，不设就用归一后的。
+    这么留着是为了能跑 A/B：**同一次评测，只换标签来源，看归一到底有没有用**。
+    """
+    if 用归一 is None:
+        用归一 = not os.environ.get("EVAL_RAW_TAGS", "")
+
+    if 用归一:
+        sql = ("""SELECT m.id,m.篇,m.source FROM 医案 m
+                  WHERE EXISTS(SELECT 1 FROM 医案因子 f WHERE f.医案id=m.id
+                                 AND f.维度 IN ('症状','舌脉'))
+                    AND EXISTS(SELECT 1 FROM 处方 c WHERE c.医案id=m.id)""")
+    else:
+        sql = ("""SELECT m.id,m.篇,m.source FROM 医案 m
+                  WHERE m.症状 IS NOT NULL AND m.症状 NOT IN ('','[]')
+                    AND EXISTS(SELECT 1 FROM 处方 c WHERE c.医案id=m.id)""")
     参 = ()
     if 只要源:
         sql += " AND m.source=?"
@@ -103,10 +124,19 @@ def 载病案(con, 只要源=None):
                 药.append(y)
         if len(药) < 2:
             continue
-        try:
-            标签 = json.loads(r["症状"] or "[]") + json.loads(r["舌脉"] or "[]")
-        except Exception:
-            continue
+        if 用归一:
+            # 归一后的因子：一条一行，按维度归位（**顺带修掉症状/舌脉串列**）
+            标 = {"症状": [], "舌脉": []}
+            for 维, 值 in con.execute(
+                    "SELECT 维度,因子 FROM 医案因子 WHERE 医案id=? AND 维度 IN ('症状','舌脉')",
+                    (r["id"],)):
+                标[维].append(值)
+            标签 = 标["症状"] + 标["舌脉"]
+        else:
+            try:
+                标签 = json.loads(r["症状"] or "[]") + json.loads(r["舌脉"] or "[]")
+            except Exception:
+                continue
         if not 标签:
             continue
         出.append({"id": r["id"], "篇": r["篇"], "source": r["source"],
@@ -246,11 +276,11 @@ def 跑(条数=30, 并发=8):
             "明细": [d for d in 明细 if not d["对"]][:20],   # 只存答错的，方便复盘
         }
         con.execute("INSERT INTO 评测记录(时间,名称,样本数,指标) VALUES(?,?,?,?)",
-                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "方剂四选一",
+                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "方剂四选一 · " + 标签来源名(),
                      n, json.dumps(指标, ensure_ascii=False)))
         con.commit()
 
-        return {"ok": True, "名称": "方剂四选一", "题数": n,
+        return {"ok": True, "名称": "方剂四选一 · " + 标签来源名(), "题数": n,
                 "准确率": 准确, "基线": 0.25, "答对": 对,
                 "出题成功率": 出题率, "均耗时秒": 指标["均耗时秒"],
                 "来源": 源计, "指标": 指标}

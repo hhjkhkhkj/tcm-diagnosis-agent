@@ -721,8 +721,10 @@ function 画(d){
       「共有」列才是你要看的——共有几个、是哪几个。</div>`;
   if(!d.相似病案.length) h+=`<span class="empty">无</span>`;
   d.相似病案.forEach(s=>{
+    const 经 = (s.六经 && s.六经.length)
+      ? `<span class="v"> ｜ 该案判：<b>${s.六经.map(esc).join("、")}</b></span>` : "";
     h+=`<div class="row"><span class="w">加权 ${s.加权}</span><span class="k">${esc(s.方名)}</span>
-        <span class="v"> — ${esc(s.篇)} ${esc(s.页)}</span>
+        <span class="v"> — ${esc(s.篇)} ${esc(s.页)}</span>${经}
         <div class="v">共有：${s.共有.map(esc).join("、")}</div>`;
     const f=s.附属||{};
     if(f.加减&&f.加减.length) h+=`<div class="v">　加减：${f.加减.map(esc).join("；")}</div>`;

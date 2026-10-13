@@ -28,6 +28,37 @@ sys.path.insert(0, HERE)
 经序 = ["太阳", "阳明", "少阳", "太阴", "少阴", "厥阴"]
 
 
+def 数据指纹(con=None):
+    """库当前状态的指纹 —— **数据一变，这个串就变**。
+
+    为什么需要：这些报告全是**从 `医案因子` 算出来的快照**。
+    词表一改、抽取一跑，原来的数就对不上了，但报告自己不知道。
+    把指纹写在文档头，以后一眼就能看出「这份是哪一版数据算的、要不要重跑」。
+    """
+    import hashlib
+    import datetime
+    con = con or sqlite3.connect(DB)
+    h = hashlib.md5()
+    行 = 0
+    for r in con.execute("SELECT 医案id,维度,因子,来源 FROM 医案因子 ORDER BY 1,2,3,4"):
+        h.update(("%s|%s|%s|%s\n" % tuple(r)).encode("utf-8"))
+        行 += 1
+    因 = con.execute("SELECT COUNT(DISTINCT 因子) FROM 医案因子").fetchone()[0]
+    原 = con.execute("SELECT COUNT(DISTINCT 医案id) FROM 医案因子"
+                     " WHERE 维度='六经' AND 来源='原文'").fetchone()[0]
+    return {"行": 行, "因子": 因, "原文六经案": 原,
+            "指纹": h.hexdigest()[:8],
+            "生成": datetime.datetime.now().strftime("%Y-%m-%d %H:%M")}
+
+
+def 指纹行(con=None):
+    d = 数据指纹(con)
+    return ("> **数据指纹**：`医案因子` %d 行 ／ %d 个因子 ／ 原文六经 %d 案 "
+            "／ 指纹 `%s` ／ 生成 %s\n"
+            ">\n> 数据一变这串就变。对不上说明这份报告是旧数据算的，要重跑。\n"
+            % (d["行"], d["因子"], d["原文六经案"], d["指纹"], d["生成"]))
+
+
 def 取():
     con = sqlite3.connect(DB)
     案因子 = defaultdict(set)
@@ -135,6 +166,8 @@ def 共现(案因子, 词频, 上限=12, 门槛=8):
 def 写报告(剖, mi, 共, 各经案, 案经, 词频, 路径):
     with open(路径, "w", encoding="utf-8") as w:
         w.write("# 因子分析 —— 从一致因子集合里找「哪些因素真的影响判断」\n\n")
+        w.write(指纹行())
+        w.write("\n")
         w.write("**这版是库的画像，不是判别器** —— 预测「该开哪个方」需要疗效随访，库里一条都没有。\n\n")
         w.write("Y 只用 `依据=原文` 的六经（157 案）；太阴原文批一条都没有，就当没有。\n\n")
 

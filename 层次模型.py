@@ -63,6 +63,8 @@ def main():
     p = os.path.join(HERE, "因子重要性层次.md")
     with open(p, "w", encoding="utf-8") as w:
         w.write("# 中医大脑 · 因子重要性层次\n\n")
+        w.write(A.指纹行())
+        w.write("\n")
         w.write("生成：`py _层次模型.py`　｜　数据：%d 案有标签 / %d 个 ≥5 次因子 / 原文六经 %d 案\n\n"
                 % (len(案因子), len([f for f, c in 词频.items() if c >= 5]), len(案经)))
 
