@@ -20,6 +20,7 @@
 
 **每次改完检索/抽取/读数据的代码，跑一次。** 数对不上就是有问题。
 """
+import glob
 import os
 import re
 import sqlite3
@@ -228,6 +229,79 @@ def main():
         print("  ⚠️ 很可能**读的是半截**：视图把多个来源并起来了，代码却只读了其中一张。")
     else:
         print("  ✓ 没有这个问题")
+
+    # ── 九、文档 vs 代码 ──
+    # 2026-10-14 加。**一天里被抓出四次「文档说的和代码做的不一样」**：
+    #   ① README 说会诊/抽取用 flash，实际两层都是 kimi-k3
+    #   ② config.example.py 教人配 LLM_URL，而代码读的是 推演_URL
+    #      —— 照它配会被**静默忽略、悄悄退回 DeepSeek，且不报错**（最坏的一种）
+    #   ③ 17 个 .py 在仓库里，README 一个字没提
+    #   ④ README 说「不能定方」，代码里写着「你有处方权」—— **定位级**的错
+    # **这四条全都能自动查。** 手工核对靠不住：文档是手写的，代码是改的，两边必然漂。
+    import re as _re2
+    仓 = r"D:\Download\tcm-diagnosis-agent"
+    print("\n【九】文档 vs 代码")
+    if not os.path.isdir(仓):
+        print("  （找不到仓库目录，跳过）")
+    else:
+        def _读(p):
+            return open(p, encoding="utf-8", errors="ignore").read()
+        rm = os.path.join(仓, "README.md")
+        if not os.path.exists(rm):
+            print("  ⚠️ 仓库里没有 README.md")
+            r = ""
+        else:
+            r = _读(rm)
+        if r:
+            仓py = {os.path.basename(p) for p in glob.glob(os.path.join(仓, "*.py"))}
+            没提 = sorted(f for f in 仓py if f not in r)
+            查("仓库的 .py 都被 README 提到", len(没提), lambda v: v == 0,
+               ("、".join(没提[:6]) + ("…" if len(没提) > 6 else "")) if 没提 else "")
+            引用 = {x for x in _re2.findall(r"`([^`\s]+\.py)`", r)} - {"config.py"}
+            缺 = sorted(f for f in 引用 if not os.path.exists(os.path.join(仓, f)))
+            查("README 引用的 .py 都存在", len(缺), lambda v: v == 0,
+               "、".join(缺[:6]) if 缺 else "")
+
+        # config.example.py 的键 vs 代码真正 `_取` 的键
+        ex = os.path.join(仓, "config.example.py")
+        要 = set()
+        for f in 活:
+            p = os.path.join(HERE, f)
+            if os.path.exists(p):
+                要 |= set(_re2.findall(r'_取\("([^"]+)"\)', _读(p)))
+        if 要 and os.path.exists(ex):
+            有 = set(_re2.findall(r"^([A-Za-z_\u4e00-\u9fa5][\w\u4e00-\u9fa5]*)\s*=", _读(ex), _re2.M))
+            查("config.example 少的键（代码会读但样板没有）", len(要 - 有), lambda v: v == 0,
+               "、".join(sorted(要 - 有)) if 要 - 有 else "")
+            查("config.example 多的键（样板教人配、代码不读）", len(有 - 要), lambda v: v == 0,
+               "、".join(sorted(有 - 要)) if 有 - 要 else "")
+
+        # README 里写的模型名，是否覆盖代码实际在用的
+        if r:
+            try:
+                from 模型判断 import DS_MODEL, JEV_MODEL
+                import config as _cfg
+                模型名 = {DS_MODEL, JEV_MODEL,
+                          getattr(_cfg, "推演_MODEL", None), getattr(_cfg, "抽取_MODEL", None)}
+            except Exception:
+                模型名 = set()
+            低 = r.lower()
+            漏 = sorted(m for m in 模型名 if m and m.split("/")[-1].replace("-latest", "") not in 低)
+            查("README 覆盖了代码在用的每个模型", len(漏), lambda v: v == 0,
+               "README 里没提：" + "、".join(漏) if 漏 else "")
+
+        # 几个关键计数：README 里写的数，跟库里实际对不对
+        if r:
+            错 = []
+            for 名, sql in [("文献块", "SELECT COUNT(*) FROM 文献块"),
+                            ("医案", "SELECT COUNT(*) FROM 医案")]:
+                try:
+                    n = con.execute(sql).fetchone()[0]
+                except Exception:
+                    continue
+                if str(n) not in r:
+                    错.append("%s 实际 %d，README 里找不到这个数" % (名, n))
+            查("README 的关键计数跟库一致", len(错), lambda v: v == 0, "；".join(错))
 
     con.close()
     print("\n" + "=" * 62)
