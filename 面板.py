@@ -419,7 +419,8 @@ def 连库():
     c.row_factory = sqlite3.Row
     # 旧库可能没有这两列，只加不删
     for col, typ in [("随访日期", "TEXT"), ("随访完成", "INTEGER"),
-                     ("推演方向", "TEXT"), ("实际方向", "TEXT"), ("变量标记", "TEXT")]:
+                     ("推演方向", "TEXT"), ("实际方向", "TEXT"),
+                     ("变量标记", "TEXT"), ("偏差判定", "TEXT")]:
         try:
             c.execute("ALTER TABLE 我的病案 ADD COLUMN %s %s" % (col, typ))
         except Exception:
@@ -475,17 +476,59 @@ def 待回访():
     return {"待回访": rows}
 
 
+def 判偏差(推演: str, 实际: str) -> dict:
+    """对比「上次推演」和「实际走向」，给标签 + 理由 + 可能变量。
+
+    只做提示、不做裁决：判错的成本是医师多看一眼，判对的收益是偏离能被筛出来。
+    """
+    if not (推演 or "").strip() or not (实际 or "").strip():
+        return {"判定": "无法判断", "理由": "缺少推演方向或实际走向", "变量提示": ""}
+    p = (
+        "你是中医复诊分析助手。下面是一条病案的[上次推演]和[本次实际走向]。\n"
+        "请判断三件事：① 实际走向与推演是否一致 ② 若不一致，偏在哪一步 ③ 可能由什么外部变量造成。\n"
+        "判定只能取：一致 / 偏慢 / 偏离 / 反向 / 无法判断。\n"
+        "变量提示只能从：情志、饮食、作息、外感、其他用药、未知 中选，可多选。\n"
+        '只输出 JSON：{"判定":"...","理由":"一句话","变量提示":"..."}\n\n'
+        f"[上次推演] {推演}\n[实际走向] {实际}"
+    )
+    try:
+        r = requests.post(
+            推演_URL,
+            headers={"Authorization": "Bearer " + 推演_KEY, "Content-Type": "application/json"},
+            json={"model": 推演_MODEL,
+                  "messages": [{"role": "user", "content": p}],
+                  "temperature": 推演_TEMP,
+                  "response_format": {"type": "json_object"}},
+            timeout=90)
+        r.raise_for_status()
+        d = json.loads(r.json()["choices"][0]["message"]["content"])
+        判定 = str(d.get("判定", "")).strip() or "无法判断"
+        return {"判定": 判定,
+                "理由": str(d.get("理由", "")).strip(),
+                "变量提示": str(d.get("变量提示", "")).strip()}
+    except Exception as e:  # noqa: BLE001 —— 判定失败不能挡住随访落库
+        return {"判定": "无法判断", "理由": "判定没跑成：" + str(e)[:80], "变量提示": ""}
+
+
 @app.post("/随访")
 def 随访接口(请求数据: 随访请求):
     """回访 = 一个定位点：上次推演说往哪走，实际走到哪，差在哪。"""
     c = 连库()
+    旧 = c.execute("SELECT 推演方向 FROM 我的病案 WHERE id=?", (请求数据.id,)).fetchone()
+    推演 = (旧["推演方向"] if 旧 and 旧["推演方向"] else "")
+    偏差 = 判偏差(推演, 请求数据.实际方向)
+    判定文本 = 偏差["判定"]
+    if 偏差["理由"]:
+        判定文本 += " · " + 偏差["理由"]
+    if 偏差["变量提示"]:
+        判定文本 += " · 可能变量：" + 偏差["变量提示"]
     c.execute("""UPDATE 我的病案
-        SET 效果=?, 实际方向=?, 变量标记=?, 随访日期=?, 随访完成=1 WHERE id=?""",
-              (请求数据.效果, 请求数据.实际方向, 请求数据.变量,
+        SET 效果=?, 实际方向=?, 变量标记=?, 偏差判定=?, 随访日期=?, 随访完成=1 WHERE id=?""",
+              (请求数据.效果, 请求数据.实际方向, 请求数据.变量, 判定文本,
                请求数据.随访日期 or datetime.now().strftime("%Y-%m-%d"), 请求数据.id))
     c.commit()
     c.close()
-    return {"ok": True}
+    return {"ok": True, "偏差": 判定文本, "模型变量": 偏差["变量提示"]}
 
 
 @app.post("/评测")
@@ -1264,6 +1307,7 @@ async function 载病案(){
       ${v.处方?`<div class="v" style="font-size:11.5px;margin-top:6px">${esc(v.处方)}</div>`:""}
       ${v.推演方向?`<div style="margin-top:6px;font-size:12px"><b>推演方向：</b>${esc(v.推演方向)}</div>`:""}
       ${v.实际方向?`<div style="margin-top:4px;font-size:12px"><b>实际走向：</b>${esc(v.实际方向)}${v.变量标记?`　<span style="color:#8c2f21">变量：${esc(v.变量标记)}</span>`:""}</div>`:""}
+      ${v.偏差判定?`<div style="margin-top:4px;font-size:12px;color:#8c2f21"><b>偏差：</b>${esc(v.偏差判定)}</div>`:""}
       ${效果?`<div style="margin-top:8px;padding:8px 10px;background:#f6f3ee;border-radius:6px;font-size:12.5px"><b>效果：</b>${esc(效果)}</div>`
         : (回访到期
           ? `<div style="margin-top:8px;padding:8px 10px;background:#fdf3f0;border:1px solid #e0b4ad;border-radius:6px">
@@ -1288,9 +1332,15 @@ window.填回访=async(id)=>{
   const 实际=$("#方"+id).value.trim();
   if(!v&&!实际){alert("写点效果或实际走向再存");return;}
   const 变量=[...document.querySelectorAll('.vb[data-id="'+id+'"]:checked')].map(x=>x.value).join("、");
-  await fetch("/随访",{method:"POST",headers:{"Content-Type":"application/json"},
+  const r=await fetch("/随访",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({id:id,效果:v,实际方向:实际,变量:变量})});
+  const j=await r.json();
   载病案();
+  if(j.偏差){
+    $("#病案列表").insertAdjacentHTML("afterbegin",
+      '<div class="card" style="margin-bottom:10px;padding:10px 12px;border-left:3px solid #8c2f21;font-size:12.5px">'+
+      '<b>偏差判定：</b>'+esc(j.偏差)+'</div>');
+  }
 };
 
 // 录入一条病案
