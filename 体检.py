@@ -31,6 +31,21 @@ DB = os.path.join(HERE, "中医大脑医案库.db")
 sys.path.insert(0, HERE)
 
 问题 = []
+待办 = []          # ⚠️ 报了但不该判"不合格"的（需要人决定，比如「这张表要不要接线」）。
+                   #    它们**必须出现在最后的总结里** —— 否则就是体检自己犯它开篇骂的那个错：
+                   #    「报告了，但汇总当没看见」。2026-10-15 加。
+
+# ── 已拍板「暂存不用」的表：有数据、也有**明确理由**不用 ──
+# ⚠️ 只有**人拍过板**的才能进这里，且必须写清日期和理由。
+#    进来的表，【七】打「已记账」而不是 ⚠️ ——
+#    因为**一条永远消不掉的告警，等于训练人去忽略告警**，
+#    那跟「能被满足的检查」是一对孪生的错。
+暂存不用 = {
+    "针灸处方": "2026-10-15 定。① 手法/依据 两列 2227 行 100% 为空；"
+                "② 穴 列 451/2227 是句子残片（「故用下此二穴除胸腔瘀血」）；"
+                "③ 针灸已有覆盖 —— 那 9 条路由已接上《针灸大成》九个门。"
+                "要接线得先重抽。见 库扩展.py T15 注释。",
+}
 
 
 def 查(名, 实际, 合格, 说明=""):
@@ -66,10 +81,22 @@ def main():
 
     受控 = os.path.join(HERE, "_受控词表.json")
     if os.path.exists(受控):
+        # ⚠️ 这条原来判的是 `v >= 100` —— **只验证"这文件不是空的"，不验证"它是不是当前的"**。
+        #    于是 `_受控词表.json` 停在 10-11（113 个词），而词表归一 10-13 早就做到 247 了，
+        #    检查照样打 ✓，**模型三年挑不到另外 134 个因子**。
+        #    **能被满足的检查 ≠ 对的检查**（今天第 4 次同一个形状）。
+        #    改成拿库里的规范因子**逐条比对** —— 多一个少一个都报。
         import json as _json
         d = _json.load(open(受控, encoding="utf-8"))
-        查("面板发的词表（_受控词表.json）", len(d.get("舌脉", [])) + len(d.get("症状", [])),
-            lambda v: v >= 100, "面板「查/问诊」勾选用的就是这一套")
+        面 = set(d.get("舌脉", [])) | set(d.get("症状", []))
+        库 = {r[0] for r in con.execute(
+            "SELECT DISTINCT 因子 FROM 医案因子 WHERE 维度 IN ('症状','舌脉')")}
+        _少 = sorted(库 - 面)
+        _多 = sorted(面 - 库)
+        查("面板词表 少的因子（模型挑不到 → 检索就漏）", len(_少), lambda v: v == 0,
+           "、".join(_少[:8]) + ("…" if len(_少) > 8 else "") if _少 else "")
+        查("面板词表 多的因子（库里没有的选项）", len(_多), lambda v: v == 0,
+           "、".join(_多[:8]) if _多 else "")
 
     # ── 二、归一是否真做了 ──
     # ⚠️ 只能数「症状/舌脉」这两个维度 —— 六经/体质/治法/病程是抽取来的，
@@ -96,10 +123,19 @@ def main():
         print("  ✗ 安全底线 取不到：%s" % str(e)[:80])
         问题.append(("安全底线", "异常", str(e)[:80]))
 
-    # ── 四、死链扫描（指向字段为空 = 桥是断的）──
-    print("\n【四】死链（「指向」字段为空）")
+    # ── 四、死链扫描 ──
+    # ⚠️ 2026-10-15 大修。原来这里只查 `目标id IS NULL` —— **只问"填了没有"，不问"填的对不对"。**
+    #    实测：66 条关键词路由里 **33 条的目标表是错的**。病因是**名同物异**：
+    #    「针灸」既是路由的 `类别`，也是一张**表名**；回填脚本拿 `类别` 去填 `目标表`，
+    #    于是 id（一直是文献块 id）和表名对不上。六经/本草/医案/剂量_规范 同理。
+    #    后果：`检索.py` 的 `路由反查()` 只认 `目标表='文献块'`，那 33 条**从没被读过**。
+    #    而这条检查全打 ✓ —— 一条都没拦住。**「不是空」是最松的那种满足。**
+    #    现在：① 目标表必须是库里真实存在的表/视图；② 目标id 必须在目标表里真的存在。
+    print("\n【四】死链（指向的东西存不存在）")
     表 = [r[0] for r in con.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")]
+    对象名 = sorted({r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type IN ('table','view')")})
     for t in 表:
         列 = [r[1] for r in con.execute("PRAGMA table_info(%s)" % t)]
         if "目标id" in 列:
@@ -107,6 +143,54 @@ def main():
             总 = con.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0]
             查("%s 目标id 为空" % t, "%d/%d" % (空, 总), lambda v: int(v.split("/")[0]) == 0,
                "★ 2026-10-14 发现：关键词路由 59/66 指向没入库的文件")
+        if {"目标表", "目标id"} <= set(列):
+            _乱 = con.execute(
+                "SELECT COUNT(*) FROM %s WHERE COALESCE(目标表,'')<>''"
+                " AND 目标表 NOT IN (%s)" % (t, ",".join("?" * len(对象名))),
+                对象名).fetchone()[0]
+            查("%s 目标表 指向不存在的表" % t, _乱, lambda v: v == 0,
+               "声明了一个库里没有的表名")
+            _断 = 0
+            for _r in con.execute(
+                    "SELECT 目标表,目标id FROM %s WHERE 目标id IS NOT NULL" % t):
+                if _r[0] not in 对象名:
+                    continue                       # 上一条已经报过了
+                try:
+                    if not con.execute("SELECT 1 FROM %s WHERE id=?" % _r[0],
+                                       (_r[1],)).fetchone():
+                        _断 += 1
+                except sqlite3.Error:               # 那张表没有 id 列
+                    _断 += 1
+            查("%s 目标id 在目标表里查无此行" % t, _断, lambda v: v == 0,
+               "★ 2026-10-15 踩过：33 条路由目标表填错（名同物异），这条原来全打 ✓")
+
+        # 路由表专有：`路由反查()` 只认 `目标表='文献块'`（见 检索.py:452）。
+        # 别的目标表**填得再对也不会被读** —— 那是"存了但没接线"，不是数据错，
+        # 所以进「待办」不进「不合格」。（改之前这里是 33 条，见 _修路由2.py。）
+        if t == "关键词路由":
+            # ⚠️ 出处里带「⚠️暂存」的行**不算** —— 那是已经记账的（见 _修路由2.py / 交接文档 9.4）。
+            #    没记账的才算待办。
+            _外 = con.execute(
+                "SELECT COUNT(*) FROM 关键词路由 WHERE COALESCE(目标表,'')<>'文献块'"
+                " AND COALESCE(出处,'') NOT LIKE '%⚠️暂存%'").fetchone()[0]
+            _记 = con.execute(
+                "SELECT COUNT(*) FROM 关键词路由 WHERE COALESCE(目标表,'')<>'文献块'"
+                " AND COALESCE(出处,'') LIKE '%⚠️暂存%'").fetchone()[0]
+            if _记:
+                print("  ○ 另有 %d 条路由「暂存」不读（已记账）" % _记)
+            if _外:
+                # ⚠️ 这个 con 没设 row_factory（脚本里另开的 `测` 才设），取的是元组，别写 dict(x)
+                行 = list(con.execute(
+                    "SELECT id,关键词,目标表,目标id FROM 关键词路由"
+                    " WHERE COALESCE(目标表,'')<>'文献块'"))
+                print("\n  ⚠️ %d 条路由的目标表不是 `文献块`，路由反查读不到它们：" % _外)
+                for _i, _词, _tb, _tid in 行:
+                    print("     #%s %s → %s id=%s" % (_i, (_词 or "")[:24], _tb, _tid))
+                待办.append(("路由反查读不到的路由", "%d 条（%s）"
+                             % (_外, "、".join("#%s" % x[0] for x in 行)),
+                             "接进 路由反查，或改指文献块，或删"))
+            else:
+                print("\n  ✓ 每条路由的目标表都是 路由反查 会读的")
 
     # ── 五、新增索引的覆盖率（今天刚加的，会随数据变）──
     print("\n【五】新索引覆盖率")
@@ -191,19 +275,31 @@ def main():
                 if t not in 可达 and t in sql[0]:
                     可达.add(t)
                     变了 = True
-    断 = []
+    断, 记账 = [], []
     for t in 表:
         n = con.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0]
         if n == 0:
             continue
         if t not in 可达:
-            断.append((t, n))
+            if t in 暂存不用:
+                记账.append((t, n))
+            else:
+                断.append((t, n))
     if 断:
         for t, n in 断:
             print("  ⚠️ %-16s %5d 行" % (t, n))
         print("  ⚠️ 上面这些表，**模型永远看不到** —— 检索不读就等于没有。")
         print("     接线（像 `验方反查` 接 T17），或明确记下「暂存不用」；别默认它在起作用。")
-    else:
+        待办.append(("有数据但活路径没人读的表", "%s（共 %d 行）"
+                     % ("、".join(t for t, _ in 断), sum(n for _, n in 断)),
+                     "接线，或记下「暂存不用」"))
+    if 记账:
+        # ⚠️ **不报成 ⚠️**，但仍然印出来 —— 目的是让"没接线"这件事一直看得见，
+        #    而不是让它悄悄变成"看起来在工作"。（2026-10-15 加，见文件顶部 暂存不用）
+        for t, n in 记账:
+            print("  ○ %-16s %5d 行  ← 已记账「暂存不用」，不是遗漏" % (t, n))
+            print("      理由：%s" % 暂存不用[t])
+    if not 断 and not 记账:
         print("  ✓ 有数据的表都在活路径里")
 
     # ── 八、视图没被读、底表却被读了 ──
@@ -227,6 +323,7 @@ def main():
         for v, 底 in 疑:
             print("  ⚠️ 视图 `%s` 没人读，但它的底表 %s 在被读" % (v, "、".join(底)))
         print("  ⚠️ 很可能**读的是半截**：视图把多个来源并起来了，代码却只读了其中一张。")
+        待办.append(("视图没人读、底表被读（读的是半截）", "、".join(v for v, _ in 疑), ""))
     else:
         print("  ✓ 没有这个问题")
 
@@ -294,7 +391,10 @@ def main():
         if r:
             错 = []
             for 名, sql in [("文献块", "SELECT COUNT(*) FROM 文献块"),
-                            ("医案", "SELECT COUNT(*) FROM 医案")]:
+                            ("医案", "SELECT COUNT(*) FROM 医案"),
+                            # ⚠️ 这个数是**会变的**（重出词表时 247→241），加进来才拦得住漂
+                            ("规范因子", "SELECT COUNT(DISTINCT 因子) FROM 医案因子"
+                                     " WHERE 维度 IN ('症状','舌脉')")]:
                 try:
                     n = con.execute(sql).fetchone()[0]
                 except Exception:
@@ -303,13 +403,50 @@ def main():
                     错.append("%s 实际 %d，README 里找不到这个数" % (名, n))
             查("README 的关键计数跟库一致", len(错), lambda v: v == 0, "；".join(错))
 
+    # ── 十、结构化字段里落单的 markdown 标记 ──
+    # 2026-10-15 加。起因：抽取器把「**配对的标记**」当成「trim 星号」处理 ——
+    #     '**分流处理**：常规用倪'.strip('*')  →  '分流处理**：常规用倪'
+    # 于是 `场景路由.用谁` 有三行**只丢了开头那半个**，在提示词里就是一个配不成对的
+    # `**`，纯噪音。**有源文件逐行作证**（_tcm_src/…/SKILL.md 的「核心立场融合」表，
+    # 6/6 吻合），不是随机脏数据。修法见 `_补粗体标记.py`。
+    # 判据：`**` 个数为**奇数** = 被吞了半个。
+    #
+    # ⚠️ **必须排掉原文大字段**：`医案.全文` / `文献块.正文` 里的星号是**原文自带的** ——
+    #    星号横线（`***注意`、`******************`）、**故意打码的人名**（`学生王**`）、
+    #    以及正文里的 OCR 噪声，一共 23 处。不排掉它就会永远误报 ——
+    #    **一条永远消不掉的告警，等于训练人去忽略告警。**
+    print("\n【十】结构化字段里落单的 `**`（被吞了半个标记）")
+    _原文大列 = {"医案.全文", "文献块.正文"}
+    _落 = []
+    for t in 表:
+        for c in [r[1] for r in con.execute("PRAGMA table_info(%s)" % t)]:
+            if "%s.%s" % (t, c) in _原文大列:
+                continue
+            try:
+                _行 = list(con.execute(
+                    "SELECT [%s] FROM [%s] WHERE [%s] LIKE '%%**%%'" % (c, t, c)))
+            except sqlite3.Error:
+                continue
+            _n = sum(1 for (_v,) in _行 if (_v or "").count("**") % 2 == 1)
+            if _n:
+                _落.append((t, c, _n))
+    查("落单 `**` 的（表, 列）组合数", len(_落), lambda v: v == 0,
+       "；".join("%s.%s ×%d" % x for x in _落) if _落 else "")
+
     con.close()
     print("\n" + "=" * 62)
     if 问题:
         print("⚠️ %d 项不合格：" % len(问题))
         for 名, 实际, 说明 in 问题:
             print("   · %s = %s%s" % (名, 实际, ("   ← " + 说明) if 说明 else ""))
-    else:
+    if 待办:
+        # ⚠️ 2026-10-15 加。原来 七/八 打了 ⚠️ 却**不进任何汇总**，最后照样印「全过」——
+        #    体检自己犯的正是它开篇骂的那个错：**报告了，但汇总当没看见**。
+        print("%s %d 项待处理（不是错，是要人拍板）："
+              % ("⚠️" if 问题 else "✅ 硬性检查全过，但仍有", len(待办)))
+        for 名, 实际, 说明 in 待办:
+            print("   · %s = %s%s" % (名, 实际, ("   ← " + 说明) if 说明 else ""))
+    if not 问题 and not 待办:
         print("全过。")
     print("=" * 62)
 

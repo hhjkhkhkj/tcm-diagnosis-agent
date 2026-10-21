@@ -87,12 +87,15 @@ class 录入请求(BaseModel):
     处方: str = ""
     效果: str = ""
     备注: str = ""
+    推演方向: str = ""
     随访天数: int = 14
 
 
 class 随访请求(BaseModel):
     id: int
     效果: str = ""
+    实际方向: str = ""
+    变量: str = ""
     随访日期: str = ""
 
 
@@ -415,7 +418,8 @@ def 连库():
     c = sqlite3.connect(DB, check_same_thread=False)
     c.row_factory = sqlite3.Row
     # 旧库可能没有这两列，只加不删
-    for col, typ in [("随访日期", "TEXT"), ("随访完成", "INTEGER")]:
+    for col, typ in [("随访日期", "TEXT"), ("随访完成", "INTEGER"),
+                     ("推演方向", "TEXT"), ("实际方向", "TEXT"), ("变量标记", "TEXT")]:
         try:
             c.execute("ALTER TABLE 我的病案 ADD COLUMN %s %s" % (col, typ))
         except Exception:
@@ -434,12 +438,13 @@ def 录入接口(请求数据: 录入请求):
         c = 连库()
         随访 = (datetime.now() + timedelta(days=请求数据.随访天数)).strftime("%Y-%m-%d") if 请求数据.随访天数 else None
         c.execute("""INSERT INTO 我的病案
-            (日期,患者,四诊原文,症状,舌脉,证型,方名,处方,效果,备注,随访日期,随访完成)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,0)""",
+            (日期,患者,四诊原文,症状,舌脉,证型,方名,处方,效果,备注,推演方向,随访日期,随访完成)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0)""",
                   (datetime.now().strftime("%Y-%m-%d"), 请求数据.患者, 请求数据.四诊原文,
                    json.dumps(症状, ensure_ascii=False), json.dumps(舌脉, ensure_ascii=False),
                    请求数据.证型, 请求数据.方名,
-                   json.dumps(药, ensure_ascii=False), 请求数据.效果, 请求数据.备注, 随访))
+                   json.dumps(药, ensure_ascii=False), 请求数据.效果, 请求数据.备注,
+                   请求数据.推演方向, 随访))
         c.commit()
         c.close()
         return {"ok": True, "抽到标签": 标签, "抽到药": ["%s%gg" % (x["药"], x["量"]) for x in 药],
@@ -463,7 +468,7 @@ def 待回访():
     """到期 / 过期还没填效果的病案 —— 这是 Y 的来源，攒数据的那个入口"""
     c = 连库()
     rows = [dict(r) for r in c.execute("""
-        SELECT id,日期,患者,证型,方名,处方,随访日期 FROM 我的病案
+        SELECT id,日期,患者,证型,方名,处方,推演方向,随访日期 FROM 我的病案
         WHERE (随访完成 IS NULL OR 随访完成=0) AND 随访日期 IS NOT NULL AND 随访日期<='今'
         ORDER BY 随访日期""".replace("'今'", "date('now')"))]
     c.close()
@@ -472,10 +477,12 @@ def 待回访():
 
 @app.post("/随访")
 def 随访接口(请求数据: 随访请求):
-    """回访到了就填效果 —— 这一步填下去，「这个方对不对」才从猜变成有数"""
+    """回访 = 一个定位点：上次推演说往哪走，实际走到哪，差在哪。"""
     c = 连库()
-    c.execute("UPDATE 我的病案 SET 效果=?, 随访日期=?, 随访完成=1 WHERE id=?",
-              (请求数据.效果, 请求数据.随访日期 or datetime.now().strftime("%Y-%m-%d"), 请求数据.id))
+    c.execute("""UPDATE 我的病案
+        SET 效果=?, 实际方向=?, 变量标记=?, 随访日期=?, 随访完成=1 WHERE id=?""",
+              (请求数据.效果, 请求数据.实际方向, 请求数据.变量,
+               请求数据.随访日期 or datetime.now().strftime("%Y-%m-%d"), 请求数据.id))
     c.commit()
     c.close()
     return {"ok": True}
@@ -772,6 +779,73 @@ def 造材料(标签):
     else:
         out.append("（本次没有可查的本草条目）")
 
+    # ── 规则层：六张「存了但没接线」的小表 ──
+    # 2026-10-15 才接上。`_体检.py`【七】把它们抓出来的：**有数据、建了很久、
+    # 活路径里一个消费者都没有** —— 不报错、不报警，只是**白存**。
+    # 这跟"静默少给数据"是一个家族：**一个是少给，一个是白给**，症状一样安静。
+    #   T4 合病 8 ／ T5 场景路由 13 ／ T7 双师对照 19 ／ T8 剂量决策 3 ／ T11 剂量_规范 45 ／ 方名表 25
+    out.append("\n### 规则层（合病 / 场景路由 / 双师对照 / 剂量决策 / 剂量_规范 / 方名表）")
+    try:
+        _规 = 库.规则层(标签, 方名列表=[f for f, _, _ in 候选], 药序=药序)
+    except Exception as _e:
+        _规 = {}
+        print("[规则层挂了]", str(_e)[:120])
+
+    if _规.get("合病"):
+        out.append("\n**合病 / 并病**（两经以上同时发病时**先治谁**）：")
+        for _r in _规["合病"]:
+            out.append("- 【%s】%s → **%s**%s"
+                       % (_r.get("类型") or "", _r.get("含义") or "",
+                          _r.get("治则") or "",
+                          ("　特征：%s" % _r["症状特征"]) if _r.get("症状特征") else ""))
+            if _r.get("方剂"):
+                out.append("    方剂：%s" % _r["方剂"])
+
+    if _规.get("场景"):
+        out.append("\n**场景路由**（这家在这个场景下的**立场** —— 不是判据，是「该往哪边想」）：")
+        for _r in _规["场景"]:
+            out.append("- %s ｜ %s" % (_r.get("场景") or "", _r.get("用谁") or ""))
+            if _r.get("判据"):
+                out.append("    判据：%s" % _r["判据"])
+
+    if _规.get("双师对照"):
+        out.append("\n**双师对照**（同一证型，倪 / 李 各怎么走 —— **分歧处才是要你表态的地方**）：")
+        for _r in _规["双师对照"]:
+            out.append("- %s ｜ 【%s】" % (_r.get("组名") or "", _r.get("维度") or ""))
+            out.append("    倪：%s" % (_r.get("倪") or "")[:120])
+            out.append("    李：%s" % (_r.get("李") or "")[:120])
+            if _r.get("同异"):
+                out.append("    同异：%s" % _r["同异"])
+
+    if _规.get("剂量决策"):
+        out.append("\n**剂量决策树**（轻 / 中 / 重三档的判据是**体质与病程** —— "
+                   "**自己照上面「体质倾向」那段挑档**，别在这儿等着别人替你挑）：")
+        for _r in _规["剂量决策"]:
+            out.append("- 【%s】判据：%s → 走 **%s**" % (_r.get("层级") or "",
+                                                       _r.get("判据") or "", _r.get("走谁") or ""))
+            if _r.get("示例"):
+                out.append("    示例：%s" % _r["示例"])
+            if _r.get("须遵守"):
+                out.append("    ⚠️ %s" % _r["须遵守"])
+
+    if _规.get("剂量规范"):
+        out.append("\n**剂量_规范**（**倪李两家的规定值** —— 与上面「剂量分布」的**实测值**"
+                   "是两回事，别混着折算：实测说的是「这一批案子实际用了多少」，"
+                   "规范说的是「这两家规定该用多少」）：")
+        for _r in _规["剂量规范"]:
+            out.append("- %s（%s）｜ 经方原量 %s ｜ 基础有效量 %s ｜ 常用量 %s ｜ 最大量 %s"
+                       % (_r.get("药") or "", _r.get("家") or "", _r.get("经方原量") or "?",
+                          _r.get("基础有效量") or "?", _r.get("常用量") or "?",
+                          _r.get("最大量") or "?"))
+
+    if _规.get("方名"):
+        out.append("\n**方名表**（候选方里有这几个是**合方** —— 拆开看单方，别当一首方）：")
+        for _r in _规["方名"]:
+            out.append("- %s ＝ %s 味基础方" % (_r.get("方名") or "", _r.get("基础方数") or "?"))
+
+    if not any(_规.get(k) for k in ("合病", "场景", "双师", "剂量决策", "剂量规范", "方名")):
+        out.append("（六张规则表都是空的 —— 这是异常，去跑 `_体检.py`【七】）")
+
     out.append("\n### 相似病案（历史上最接近的，附该书当时的加减/方性/结构分析）")
     if 相似:
         for s in 相似:
@@ -1040,6 +1114,7 @@ mark{background:var(--hi);color:var(--ink);border-radius:3px;padding:0 2px}
         <input id="方名" placeholder="方名" style="flex:1">
       </div>
       <input id="处方" placeholder="处方，例：桂枝15g 白芍15g 炙甘草10g" style="margin-bottom:6px">
+      <textarea id="推演方向" placeholder="推演方向：几剂后该往哪走（例：三剂后夜尿减半、脉由沉转起；若见口干则转阳明）" style="height:52px;margin-bottom:6px"></textarea>
       <div style="display:flex;gap:6px;margin-bottom:8px">
         <input id="随访天数" type="number" value="14" style="width:80px">
         <span class="v" style="font-size:11px;margin-top:10px">天后回访</span>
@@ -1187,12 +1262,20 @@ async function 载病案(){
         <div class="v" style="font-size:11.5px">${esc(v.证型||"")}${v.方名?" · "+esc(v.方名):""}</div>
       </div>
       ${v.处方?`<div class="v" style="font-size:11.5px;margin-top:6px">${esc(v.处方)}</div>`:""}
+      ${v.推演方向?`<div style="margin-top:6px;font-size:12px"><b>推演方向：</b>${esc(v.推演方向)}</div>`:""}
+      ${v.实际方向?`<div style="margin-top:4px;font-size:12px"><b>实际走向：</b>${esc(v.实际方向)}${v.变量标记?`　<span style="color:#8c2f21">变量：${esc(v.变量标记)}</span>`:""}</div>`:""}
       ${效果?`<div style="margin-top:8px;padding:8px 10px;background:#f6f3ee;border-radius:6px;font-size:12.5px"><b>效果：</b>${esc(效果)}</div>`
         : (回访到期
           ? `<div style="margin-top:8px;padding:8px 10px;background:#fdf3f0;border:1px solid #e0b4ad;border-radius:6px">
               <b style="color:#8c2f21">到回访时间了</b>（${esc(v.随访日期)}）
+              ${v.推演方向?`<div style="margin-top:6px;font-size:12px"><b>上次推演：</b>${esc(v.推演方向)}</div>`:""}
+              <input id="方${v.id}" placeholder="实际走向（例：夜尿减半、脉起；或加重、转向他证）" style="margin-top:8px">
+              <div style="margin-top:6px;font-size:12px">
+                <span class="v">与推演不符时勾变量：</span>
+                ${["情志","饮食","作息","外感","其他用药"].map(t=>`<label style="margin-right:8px;white-space:nowrap"><input type="checkbox" class="vb" data-id="${v.id}" value="${t}">${t}</label>`).join("")}
+              </div>
               <div style="display:flex;gap:6px;margin-top:8px">
-                <input id="效${v.id}" placeholder="效果怎么样（好点/没变化/更差）" style="flex:1">
+                <input id="效${v.id}" placeholder="效果（好点/没变化/更差）" style="flex:1">
                 <button class="mini" onclick="填回访(${v.id})" style="padding:6px 14px">填回访</button>
               </div></div>`
           : `<div class="v" style="margin-top:6px;font-size:11.5px">回访 ${esc(v.随访日期||"未定")}${v.随访完成?"（已填）":""}</div>`)}
@@ -1202,9 +1285,11 @@ async function 载病案(){
 }
 window.填回访=async(id)=>{
   const v=$("#效"+id).value.trim();
-  if(!v){alert("写点效果再存");return;}
+  const 实际=$("#方"+id).value.trim();
+  if(!v&&!实际){alert("写点效果或实际走向再存");return;}
+  const 变量=[...document.querySelectorAll('.vb[data-id="'+id+'"]:checked')].map(x=>x.value).join("、");
   await fetch("/随访",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({id:id,效果:v})});
+    body:JSON.stringify({id:id,效果:v,实际方向:实际,变量:变量})});
   载病案();
 };
 
@@ -1212,6 +1297,7 @@ window.填回访=async(id)=>{
 $("#录病案").onclick=async()=>{
   const d={患者:$("#患者").value.trim(), 四诊原文:$("#病案四诊").value.trim(),
     证型:$("#证型").value.trim(), 方名:$("#方名").value.trim(), 处方:$("#处方").value.trim(),
+    推演方向:$("#推演方向").value.trim(),
     随访天数:parseInt($("#随访天数").value)||0};
   const r=await fetch("/录入",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(d)});
   const j=await r.json();
@@ -1219,7 +1305,7 @@ $("#录病案").onclick=async()=>{
     $("#病案列表").insertAdjacentHTML("afterbegin",
       '<div class="card" style="margin-bottom:10px;padding:10px 12px;border-left:3px solid #8c2f21;font-size:12.5px">'+
       '已存。'+esc(j.抽到药.join("、")||"未抽到药")+'；回访 '+esc(j.随访日期||"未定")+'</div>');
-    ["患者","病案四诊","证型","方名","处方"].forEach(id=>$("#"+id).value="");
+    ["患者","病案四诊","证型","方名","处方","推演方向"].forEach(id=>$("#"+id).value="");
     载病案();
   }else{
     alert("存失败了："+String(j.错误||"").slice(0,200));
